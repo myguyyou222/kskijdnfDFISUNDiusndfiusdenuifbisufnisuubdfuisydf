@@ -40,7 +40,9 @@ jobs:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           test -n "$TAILSCALE_AUTH_KEY"
-          tailscale up --auth-key "$TAILSCALE_AUTH_KEY" --hostname "opencode-${GITHUB_RUN_ID}" --advertise-tags=tag:opencode-runner --accept-dns=false --ssh=false
+          # tailscaled is root-owned on the runner; unprivileged `tailscale up`
+          # fails with "checkprefs access denied".
+          sudo tailscale up --auth-key "$TAILSCALE_AUTH_KEY" --hostname "opencode-${GITHUB_RUN_ID}" --advertise-tags=tag:opencode-runner --accept-dns=false --ssh=false
       - name: Install OpenCode
         run: npm install -g opencode-ai@1.18.30
       - name: Start OpenCode server
@@ -50,7 +52,7 @@ jobs:
         run: |
           opencode serve --hostname 0.0.0.0 --port 4096 --print-logs &
           SERVER_PID=$!
-          trap 'kill "$SERVER_PID"; tailscale logout' EXIT
+          trap 'kill "$SERVER_PID"; sudo tailscale logout' EXIT
           for i in {1..30}; do
             if curl -sS -u opencode:"${OPENCODE_SERVER_PASSWORD}" http://127.0.0.1:4096/api/health >/dev/null; then
               echo "OpenCode server healthy"

@@ -7,3 +7,5 @@ venv/
 .DS_Store
 .next/
 out/
+# local handoff notes (contain credentials — never commit)
+HANDOFF.md
