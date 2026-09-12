@@ -21,30 +21,5 @@
       # "vscodevim.vim"
       "google.gemini-cli-vscode-ide-companion"
     ];
-    workspace = {
-      # Runs when a workspace is first created with this `dev.nix` file
-      onCreate = {
-        npm-install = "npm ci --no-audit --prefer-offline --no-progress --timing";
-        # Open editors for the following files by default, if they exist
-        default.openFiles = [
-          "app/page.tsx" "app/page.js"
-          "src/app/page.tsx" "src/app/page.js"
-        ];
-      };
-      # To run something each time the workspace is (re)started, use the `onStart` hook
-      # onStart = {
-      #   "server": "npm run start",
-      # };
-    };
-    # Enable previews and customize configuration
-    previews = {
-      enable = true;
-      previews = {
-        web = {
-          # port = 3000;
-          # open = true;
-        };
-      };
-    };
   };
 }
