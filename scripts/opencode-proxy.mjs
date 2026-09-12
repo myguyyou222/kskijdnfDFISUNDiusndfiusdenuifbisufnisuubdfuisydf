@@ -10,7 +10,7 @@ const config = {
   workspace: env.OPENCODE_WORKSPACE ?? process.cwd(),
   model: env.OPENCODE_MODEL,
   directUrl: env.OPENCODE_URL,
-  tailnet: env.TAILSCALE_TAILNET,
+  tailnet: env.TAILSCALE_TAILNET || "-",
   tailscaleApiKey: env.TAILSCALE_API_KEY,
   runnerTag: env.OPENCODE_RUNNER_TAG ?? "tag:opencode-runner",
   username: env.OPENCODE_SERVER_USERNAME ?? "opencode",
