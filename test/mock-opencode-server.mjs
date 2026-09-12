@@ -115,12 +115,26 @@ const server = http.createServer(async (req, res) => {
     for (const [sid, pending] of PENDING) {
       PENDING.delete(sid);
       const text = `Hello from mock, received: ${pending.text.slice(0, 40)}`;
+      // Mirror a native tool round-trip when the prompt asks for it, so the
+      // proxy's tool_calls mapping is covered: step 1 ends with
+      // finish=tool-calls, step 2 is the follow-up with finish=stop.
+      const wantsTools = /tool/i.test(pending.text);
+      const callID = `call_${pending.msgId}`;
       const events = [
         { id: pending.msgId, type: "session.next.step.started", data: { sessionID: sid, assistantMessageID: pending.msgId } },
         { id: pending.msgId, type: "session.next.text.started", data: { sessionID: sid, assistantMessageID: pending.msgId, textID: `txt_${pending.msgId}` } },
         { id: pending.msgId, type: "session.next.text.delta", data: { sessionID: sid, assistantMessageID: pending.msgId, textID: `txt_${pending.msgId}`, delta: text } },
         { id: pending.msgId, type: "session.next.text.ended", data: { sessionID: sid, assistantMessageID: pending.msgId, textID: `txt_${pending.msgId}`, text } },
-        { id: pending.msgId, type: "session.next.step.ended", data: { sessionID: sid, assistantMessageID: pending.msgId, finish: "stop", tokens: stepTokens } },
+        ...(wantsTools ? [
+          { id: pending.msgId, type: "session.next.tool.called", data: { sessionID: sid, assistantMessageID: pending.msgId, callID, tool: "bash", input: { command: "echo mock-tool-ok" }, provider: { executed: false } } },
+          { id: pending.msgId, type: "session.next.tool.success", data: { sessionID: sid, assistantMessageID: pending.msgId, callID, structured: { exit: 0, truncated: false }, content: [{ type: "text", text: "mock-tool-ok\n" }], outputPaths: [], provider: { executed: false } } },
+        ] : []),
+        { id: pending.msgId, type: "session.next.step.ended", data: { sessionID: sid, assistantMessageID: pending.msgId, finish: wantsTools ? "tool-calls" : "stop", tokens: stepTokens } },
+        ...(wantsTools ? [
+          { id: pending.msgId, type: "session.next.step.started", data: { sessionID: sid, assistantMessageID: `next_${pending.msgId}` } },
+          { id: pending.msgId, type: "session.next.text.delta", data: { sessionID: sid, assistantMessageID: `next_${pending.msgId}`, textID: `txt2_${pending.msgId}`, delta: "done after tools" } },
+          { id: pending.msgId, type: "session.next.step.ended", data: { sessionID: sid, assistantMessageID: `next_${pending.msgId}`, finish: "stop", tokens: stepTokens } },
+        ] : []),
       ];
       for (const e of events) {
         res.write(`data: ${JSON.stringify(e)}\n\n`);

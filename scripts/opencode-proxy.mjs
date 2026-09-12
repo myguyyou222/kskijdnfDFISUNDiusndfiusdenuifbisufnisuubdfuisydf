@@ -325,7 +325,18 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
 
   const textReceived = new Set();
   let finishReason = "stop";
-  let stepTokens = null;
+  // Usage accumulates across ALL steps: multi-step turns (finish=tool-calls ->
+  // next step.started -> finish=stop) carry per-step tokens on each step.ended.
+  let usageInput = 0, usageOutput = 0, usageCacheRead = 0, usageCacheWrite = 0;
+  // OPTION A read-only tool_calls mirror: OpenCode executes tools server-side
+  // (there is no function-invocation endpoint), so the proxy surfaces each
+  // native call as an OpenAI tool_call once its input is complete
+  // (session.next.tool.called). Results are informational only — they were
+  // already consumed by the agent loop and cannot be sent back.
+  // Per OpenAI semantics one tool_call per index; callIDs are unique per call.
+  const toolCalls = [];
+  const toolResults = new Map(); // callID -> result text
+  let sawToolCallsStep = false;
   let ended = false;
 
   try {
@@ -355,25 +366,76 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
           break;
         }
         case "session.next.text.delta": {
-          const textId = props.textID || props.id;
-          if (!textReceived.has(textId)) {
-            textReceived.add(textId);
-            yield { type: "delta", text: props.delta ?? "" };
-          }
+          // Mark the textID seen AND stream the delta. text.ended later
+          // repeats the full text, which must then be skipped (else every
+          // token is doubled).
+          if (props.textID) textReceived.add(props.textID);
+          yield { type: "delta", text: props.delta ?? "" };
           break;
         }
         case "session.next.text.ended": {
+          // text.ended repeats the full text already streamed via deltas —
+          // only emit when no delta was seen for this textID (else clients
+          // see every token twice, e.g. "LIVEPROXY" + "-OK" -> truncated).
           const textId = props.textID || props.id;
-          if (!textReceived.has(textId)) {
+          if (textId && !textReceived.has(textId)) {
             textReceived.add(textId);
             yield { type: "delta", text: props.text ?? "" };
           }
           break;
         }
         case "session.next.step.ended": {
+          // A step ending with finish=tool-calls is NOT turn end: the agent
+          // loop continues with a new step.started (tool results already fed
+          // back server-side). Only the 2s quiet gap after the FINAL step ends
+          // the turn. Aggregate usage across every step.
           finishReason = props.finish ?? "stop";
-          stepTokens = props.tokens ?? null;
+          if (finishReason === "tool-calls") sawToolCallsStep = true;
+          const t = props.tokens ?? {};
+          usageInput += t.input ?? 0;
+          usageOutput += t.output ?? 0;
+          usageCacheRead += t.cache?.read ?? 0;
+          usageCacheWrite += t.cache?.write ?? 0;
           ended = true;
+          break;
+        }
+        case "session.next.tool.called": {
+          // Tool input is complete here (input.* deltas are pre-execution
+          // partials — do not stream those). Mirror as one OpenAI tool_call.
+          if (props.callID && props.tool && !toolCalls.some(c => c.id === props.callID)) {
+            toolCalls.push({
+              id: props.callID,
+              type: "function",
+              function: {
+                name: props.tool,
+                arguments: JSON.stringify(props.input ?? {}),
+              },
+            });
+            yield {
+              type: "tool_call",
+              toolCall: toolCalls[toolCalls.length - 1],
+              index: toolCalls.length - 1,
+            };
+          }
+          break;
+        }
+        case "session.next.tool.success": {
+          if (props.callID) {
+            const parts = Array.isArray(props.content) ? props.content : [];
+            const text = parts
+              .map(c => typeof c?.text === "string" ? c.text : JSON.stringify(c))
+              .join("");
+            const extra = props.structured && Object.keys(props.structured).length
+              ? `\n(structured: ${JSON.stringify(props.structured)})`
+              : "";
+            toolResults.set(props.callID, text + extra);
+          }
+          break;
+        }
+        case "session.next.tool.failed": {
+          if (props.callID) {
+            toolResults.set(props.callID, `Error: ${props.error?.message ?? "tool call failed"}`);
+          }
           break;
         }
         case "session.next.reasoning.delta": {
@@ -394,12 +456,19 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
     if (stream.return) stream.return();
   }
 
-  const usage = stepTokens ? {
-    prompt_tokens: stepTokens.input ?? 0,
-    completion_tokens: stepTokens.output ?? 0,
-    total_tokens: (stepTokens.input ?? 0) + (stepTokens.output ?? 0),
-  } : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-  yield { type: "finish", finishReason, usage };
+  // finish_reason mirrors OpenAI: "tool_calls" when the turn used native tools.
+  // Exception: a turn whose steps ALL ended stop (no tool-calls step seen)
+  // keeps "stop" even if a stray tool.called arrived without its step
+  // sequence completing. Track via sawToolCallsStep below.
+  if (finishReason !== "error" && toolCalls.length > 0 && sawToolCallsStep) {
+    finishReason = "tool_calls";
+  }
+  const usage = {
+    prompt_tokens: usageInput,
+    completion_tokens: usageOutput,
+    total_tokens: usageInput + usageOutput,
+  };
+  yield { type: "finish", finishReason, usage, toolCalls, toolResults };
 }
 
 function openaiModelList(models) {
@@ -429,7 +498,18 @@ function openaiChatCompletionChunk(id, model, delta, finishReason) {
   };
 }
 
-function openaiChatCompletionResponse(id, model, content, finishReason, usage) {
+function openaiChatCompletionResponse(id, model, content, finishReason, usage, toolCalls = [], toolResults = new Map()) {
+  const message = { role: "assistant", content };
+  if (toolCalls.length > 0) {
+    // Read-only mirror: results ride along as a trailing human-readable block
+    // (the calls already executed server-side; there is no client round-trip).
+    message.tool_calls = toolCalls;
+    const results = toolCalls.map(c => {
+      const r = toolResults.get(c.id);
+      return `Result of ${c.function.name} (${c.id}):\n${r ?? "(no result captured)"}`;
+    });
+    message.content = [content, ...results].filter(Boolean).join("\n\n");
+  }
   return {
     id,
     object: "chat.completion",
@@ -437,7 +517,7 @@ function openaiChatCompletionResponse(id, model, content, finishReason, usage) {
     model,
     choices: [{
       index: 0,
-      message: { role: "assistant", content },
+      message,
       finish_reason: finishReason,
     }],
     usage,
@@ -498,6 +578,10 @@ async function handleChatCompletions(req, res) {
       for await (const item of runCompletion(base, modelRef, promptText, signal)) {
         if (item.type === "delta") {
           res.write(`data: ${JSON.stringify(openaiChatCompletionChunk(runId, model, { content: item.text }, null))}\n\n`);
+        } else if (item.type === "tool_call") {
+          // One chunk per native call, arguments complete (no pre-execution
+          // input-delta streaming). Mirrors OpenAI's tool_calls delta shape.
+          res.write(`data: ${JSON.stringify(openaiChatCompletionChunk(runId, model, { tool_calls: [{ index: item.index, id: item.toolCall.id, type: "function", function: item.toolCall.function }] }, null))}\n\n`);
         } else if (item.type === "finish") {
           res.write(`data: ${JSON.stringify(openaiChatCompletionChunk(runId, model, {}, item.finishReason))}\n\n`);
         }
@@ -508,16 +592,20 @@ async function handleChatCompletions(req, res) {
       let fullText = "";
       let finishReason = "stop";
       let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+      let toolCalls = [];
+      let toolResults = new Map();
       for await (const item of runCompletion(base, modelRef, promptText, signal)) {
         if (item.type === "delta") fullText += item.text;
-        else if (item.type === "finish") { finishReason = item.finishReason; usage = item.usage; }
+        else if (item.type === "finish") { finishReason = item.finishReason; usage = item.usage; toolCalls = item.toolCalls ?? []; toolResults = item.toolResults ?? new Map(); }
       }
       const response = openaiChatCompletionResponse(
         `chatcmpl-${randomBytes(12).toString("hex")}`,
         model,
         fullText,
         finishReason,
-        usage
+        usage,
+        toolCalls,
+        toolResults
       );
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(response));
