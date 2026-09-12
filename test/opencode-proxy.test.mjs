@@ -115,7 +115,8 @@ async function main() {
     check("Completions has text", compBody.choices?.[0]?.text?.includes("Hello from mock"), comp.body);
 
     // Read-only tool_calls mirror: prompt containing "tool" triggers the mock's
-    // native tool round-trip (tool.called+success, finish=tool-calls -> step).
+    // native tool round-trip. With Option B, the proxy holds on finish=tool-calls
+    // and DOES NOT append results or aggregate later steps.
     const toolChat = await post(PROXY_PORT, "/v1/chat/completions", {
       model: "anthropic/claude-sonnet-4-5",
       messages: [{ role: "user", content: "Please use a tool to echo hi" }],
@@ -126,8 +127,26 @@ async function main() {
     check("Tool chat finish_reason is tool_calls", toolBody.choices?.[0]?.finish_reason === "tool_calls", toolChat.body);
     check("Tool chat mirrors native call", toolBody.choices?.[0]?.message?.tool_calls?.[0]?.function?.name === "bash", toolChat.body);
     check("Tool chat call has input args", toolBody.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments?.includes("mock-tool-ok"), toolChat.body);
-    check("Tool chat appends result text", toolBody.choices?.[0]?.message?.content?.includes("mock-tool-ok"), toolChat.body);
-    check("Tool chat aggregates multi-step usage", toolBody.usage?.completion_tokens === 68, JSON.stringify(toolBody.usage));
+    check("Tool chat usage input", toolBody.usage?.prompt_tokens !== undefined, JSON.stringify(toolBody.usage));
+
+    // Test the follow-up request to verify session affinity (Option B)
+    const followUpCallId = toolBody.choices?.[0]?.message?.tool_calls?.[0]?.id;
+    if (followUpCallId) {
+      const followUpChat = await post(PROXY_PORT, "/v1/chat/completions", {
+        model: "anthropic/claude-sonnet-4-5",
+        messages: [
+          { role: "user", content: "Please use a tool to echo hi" },
+          { role: "assistant", tool_calls: toolBody.choices?.[0]?.message?.tool_calls },
+          { role: "tool", tool_call_id: followUpCallId, content: "mock-tool-ok\n" }
+        ],
+        stream: false,
+      });
+      check("Tool follow-up returns 200", followUpChat.status === 200, `status=${followUpChat.status} body=${followUpChat.body}`);
+      const followUpBody = JSON.parse(followUpChat.body);
+      check("Tool follow-up responds correctly", followUpBody.choices?.[0]?.message?.content?.includes("Hello from mock"), followUpChat.body);
+    } else {
+      check("Tool follow-up returns 200", false, "No tool_call_id found in previous step");
+    }
 
     // Streaming tool mirror: one tool_calls chunk + finish_reason=tool_calls.
     const toolSse = await new Promise((resolve, reject) => {

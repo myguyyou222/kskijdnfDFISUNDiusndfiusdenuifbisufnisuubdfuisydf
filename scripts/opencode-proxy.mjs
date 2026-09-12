@@ -24,6 +24,7 @@ const config = {
 };
 
 let runnerCache = { baseUrl: null, expires: 0 };
+const globalToolCallToSession = new Map(); // callID -> sessionID
 
 function basicAuth() {
   const token = Buffer.from(`${config.username}:${config.password}`).toString("base64");
@@ -68,16 +69,16 @@ function selectRunner(devices) {
   return candidates[0] ?? null;
 }
 
-async function healthCheck(baseUrl) {
+async function healthCheck(baseUrl, timeoutMs = 5000) {
   try {
     const res = await fetch(`${baseUrl}/api/health`, {
       headers: { Authorization: basicAuth(), Accept: "application/json" },
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (res.ok) return true;
     const res2 = await fetch(`${baseUrl}/global/health`, {
       headers: { Authorization: basicAuth(), Accept: "application/json" },
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     return res2.ok;
   } catch {
@@ -154,11 +155,19 @@ function locationQuery() {
   return "";
 }
 
-async function listModels(baseUrl) {
-  const data = await requestJson(baseUrl, `/api/model?${locationQuery()}`);
-  return data.data ?? [];
+async function listModels(baseUrl, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const data = await requestJson(baseUrl, `/api/model?${locationQuery()}`);
+      const models = data.data ?? [];
+      if (models.length > 0) return models;
+    } catch (e) {
+      if (i === retries) throw e;
+    }
+    if (i < retries) await new Promise(r => setTimeout(r, 1500));
+  }
+  return [];
 }
-
 async function createSession(baseUrl, modelRef) {
   // NOTE: do NOT send `location.directory` — the proxy's local cwd does not
   // exist on the remote runner, and the agent loop 500s on prompts for
@@ -295,9 +304,31 @@ function openEventStream(baseUrl, signal) {
     [Symbol.asyncIterator]() { return this; },
   };
 }
+async function* runCompletion(baseUrl, modelRef, body, signal, isChat = true) {
+  let sessionId = null;
+  let promptText = "";
 
-async function* runCompletion(baseUrl, modelRef, promptText, signal) {
-  const sessionId = await createSession(baseUrl, modelRef);
+  if (isChat) {
+    const messages = body.messages ?? [];
+    const lastToolMsg = messages.slice().reverse().find(m => m.role === "tool" && m.tool_call_id);
+    if (lastToolMsg) {
+      sessionId = globalToolCallToSession.get(lastToolMsg.tool_call_id);
+    }
+
+    if (sessionId) {
+      // Option B Follow-up: Only parse and send the newly resolved messages to the existing session
+      const lastAssistantIdx = messages.map(m => m.role).lastIndexOf("assistant");
+      const newMessages = lastAssistantIdx >= 0 ? messages.slice(lastAssistantIdx + 1) : messages;
+      promptText = messagesToPrompt(newMessages);
+    } else {
+      sessionId = await createSession(baseUrl, modelRef);
+      promptText = messagesToPrompt(messages);
+    }
+  } else {
+    sessionId = await createSession(baseUrl, modelRef);
+    promptText = typeof body.prompt === "string" ? body.prompt : Array.isArray(body.prompt) ? body.prompt.join("") : "";
+  }
+  
   const messageId = generateMessageId();
 
   // Open the global event stream BEFORE posting the prompt so no execution
@@ -328,16 +359,12 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
   // Usage accumulates across ALL steps: multi-step turns (finish=tool-calls ->
   // next step.started -> finish=stop) carry per-step tokens on each step.ended.
   let usageInput = 0, usageOutput = 0, usageCacheRead = 0, usageCacheWrite = 0;
-  // OPTION A read-only tool_calls mirror: OpenCode executes tools server-side
-  // (there is no function-invocation endpoint), so the proxy surfaces each
-  // native call as an OpenAI tool_call once its input is complete
-  // (session.next.tool.called). Results are informational only — they were
-  // already consumed by the agent loop and cannot be sent back.
-  // Per OpenAI semantics one tool_call per index; callIDs are unique per call.
+  
+  // Option B: tool calls map dynamically matching native events to an ongoing session
   const toolCalls = [];
-  const toolResults = new Map(); // callID -> result text
   let sawToolCallsStep = false;
   let ended = false;
+  let breakLoop = false;
 
   try {
     const iterator = stream[Symbol.asyncIterator]();
@@ -397,6 +424,12 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
           usageCacheRead += t.cache?.read ?? 0;
           usageCacheWrite += t.cache?.write ?? 0;
           ended = true;
+
+          // Option B: Stateful relay. Break entirely on tool-calls to yield right back
+          // to the client without consuming OpenCode's background agent loop continuation.
+          if (finishReason === "tool-calls") {
+            breakLoop = true;
+          }
           break;
         }
         case "session.next.tool.called": {
@@ -411,30 +444,12 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
                 arguments: JSON.stringify(props.input ?? {}),
               },
             });
+            globalToolCallToSession.set(props.callID, sessionId);
             yield {
               type: "tool_call",
               toolCall: toolCalls[toolCalls.length - 1],
               index: toolCalls.length - 1,
             };
-          }
-          break;
-        }
-        case "session.next.tool.success": {
-          if (props.callID) {
-            const parts = Array.isArray(props.content) ? props.content : [];
-            const text = parts
-              .map(c => typeof c?.text === "string" ? c.text : JSON.stringify(c))
-              .join("");
-            const extra = props.structured && Object.keys(props.structured).length
-              ? `\n(structured: ${JSON.stringify(props.structured)})`
-              : "";
-            toolResults.set(props.callID, text + extra);
-          }
-          break;
-        }
-        case "session.next.tool.failed": {
-          if (props.callID) {
-            toolResults.set(props.callID, `Error: ${props.error?.message ?? "tool call failed"}`);
           }
           break;
         }
@@ -451,6 +466,8 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
         default:
           break;
       }
+
+      if (breakLoop) break;
     }
   } finally {
     if (stream.return) stream.return();
@@ -468,9 +485,8 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
     completion_tokens: usageOutput,
     total_tokens: usageInput + usageOutput,
   };
-  yield { type: "finish", finishReason, usage, toolCalls, toolResults };
+  yield { type: "finish", finishReason, usage, toolCalls };
 }
-
 function openaiModelList(models) {
   return {
     object: "list",
@@ -498,17 +514,10 @@ function openaiChatCompletionChunk(id, model, delta, finishReason) {
   };
 }
 
-function openaiChatCompletionResponse(id, model, content, finishReason, usage, toolCalls = [], toolResults = new Map()) {
+function openaiChatCompletionResponse(id, model, content, finishReason, usage, toolCalls = []) {
   const message = { role: "assistant", content };
   if (toolCalls.length > 0) {
-    // Read-only mirror: results ride along as a trailing human-readable block
-    // (the calls already executed server-side; there is no client round-trip).
     message.tool_calls = toolCalls;
-    const results = toolCalls.map(c => {
-      const r = toolResults.get(c.id);
-      return `Result of ${c.function.name} (${c.id}):\n${r ?? "(no result captured)"}`;
-    });
-    message.content = [content, ...results].filter(Boolean).join("\n\n");
   }
   return {
     id,
@@ -561,7 +570,6 @@ async function handleChatCompletions(req, res) {
   const body = await readBody(req);
   const stream = body.stream === true;
   const model = body.model ?? config.model;
-  const promptText = messagesToPrompt(body.messages ?? []);
   const signal = createRequestSignal(req);
   try {
     const base = await discoverRunner();
@@ -575,7 +583,7 @@ async function handleChatCompletions(req, res) {
         Connection: "keep-alive",
       });
       res.write(`data: ${JSON.stringify(openaiChatCompletionChunk(runId, model, { role: "assistant", content: "" }, null))}\n\n`);
-      for await (const item of runCompletion(base, modelRef, promptText, signal)) {
+      for await (const item of runCompletion(base, modelRef, body, signal, true)) {
         if (item.type === "delta") {
           res.write(`data: ${JSON.stringify(openaiChatCompletionChunk(runId, model, { content: item.text }, null))}\n\n`);
         } else if (item.type === "tool_call") {
@@ -593,10 +601,9 @@ async function handleChatCompletions(req, res) {
       let finishReason = "stop";
       let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
       let toolCalls = [];
-      let toolResults = new Map();
-      for await (const item of runCompletion(base, modelRef, promptText, signal)) {
+      for await (const item of runCompletion(base, modelRef, body, signal, true)) {
         if (item.type === "delta") fullText += item.text;
-        else if (item.type === "finish") { finishReason = item.finishReason; usage = item.usage; toolCalls = item.toolCalls ?? []; toolResults = item.toolResults ?? new Map(); }
+        else if (item.type === "finish") { finishReason = item.finishReason; usage = item.usage; toolCalls = item.toolCalls ?? []; }
       }
       const response = openaiChatCompletionResponse(
         `chatcmpl-${randomBytes(12).toString("hex")}`,
@@ -604,8 +611,7 @@ async function handleChatCompletions(req, res) {
         fullText,
         finishReason,
         usage,
-        toolCalls,
-        toolResults
+        toolCalls
       );
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(response));
@@ -624,7 +630,6 @@ async function handleCompletions(req, res) {
   const body = await readBody(req);
   const stream = body.stream === true;
   const model = body.model ?? config.model;
-  const prompt = typeof body.prompt === "string" ? body.prompt : Array.isArray(body.prompt) ? body.prompt.join("") : "";
   const signal = createRequestSignal(req);
   try {
     const base = await discoverRunner();
@@ -638,7 +643,7 @@ async function handleCompletions(req, res) {
         Connection: "keep-alive",
       });
       res.write(`data: ${JSON.stringify({ id: runId, object: "text_completion.chunk", created: Math.floor(Date.now()/1000), model, choices: [{ index: 0, text: "", finish_reason: null }] })}\n\n`);
-      for await (const item of runCompletion(base, modelRef, prompt, signal)) {
+      for await (const item of runCompletion(base, modelRef, body, signal, false)) {
         if (item.type === "delta") {
           res.write(`data: ${JSON.stringify({ id: runId, object: "text_completion.chunk", created: Math.floor(Date.now()/1000), model, choices: [{ index: 0, text: item.text, finish_reason: null }] })}\n\n`);
         } else if (item.type === "finish") {
@@ -650,7 +655,7 @@ async function handleCompletions(req, res) {
       let fullText = "";
       let finishReason = "stop";
       let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-      for await (const item of runCompletion(base, modelRef, prompt, signal)) {
+      for await (const item of runCompletion(base, modelRef, body, signal, false)) {
         if (item.type === "delta") fullText += item.text;
         else if (item.type === "finish") { finishReason = item.finishReason; usage = item.usage; }
       }
