@@ -33,17 +33,20 @@ node scripts/opencode-proxy.mjs
 | `POST /v1/chat/completions` | `POST /api/session` → `POST /api/session/{id}/prompt` → `GET /api/event` |
 | `POST /v1/completions` | same (legacy text-completions response shape) |
 
-## V2 contract (verified against `opencode.ai/v2/openapi.json`)
+## V2 contract (verified against a LIVE opencode-ai@1.18.30 server, 2026-09)
 
-- **`/api/session/{id}/prompt`** request body is `{ id, text, files, agents, skills?, metadata?, delivery?, resume? }` — `text` is a top-level string. There is **no** nested `prompt` object (`additionalProperties: false`).
-- The prompt response is JSON `Session.Inbox.User` (`{ id, sessionID, timeCreated, type, payload, delivery }`), **not** SSE. It has no `admittedSeq` cursor.
-- **`/api/event`** is the *single* global event route — no path params, no `after` cursor. It is filtered by the flat `directory` query param (or the `x-opencode-directory` header). The `location[directory]=...` shape is **rejected**.
-- Events are SSE lines whose `data:` field is a JSON envelope: `{ id, type, properties }`. The field is **`properties`**, not `data`.
-- Text deltas arrive as `session.next.text.delta` with `properties.delta` (not `properties.text`).
-- Turn finish is `session.next.step.ended` with `properties.finish` and `properties.tokens` (`{ input, output, reasoning, cache }`).
-- Turn completion is `session.idle` with `properties.sessionID`.
-- Errors are `session.error` / `session.next.step.failed` with `properties.error.message`.
-- **`/api/session/{id}/event` does not exist** — there is no per-session event route.
+- **`/api/session/{id}/prompt`** request body REQUIRES a nested `prompt` object:
+  `{ id?, prompt: { text, files?, agents? }, delivery?, resume? }` (`additionalProperties: false`).
+  A top-level `text` is rejected with HTTP 500 ("Unexpected server error").
+- The prompt response is an admission receipt: `{ data: { admittedSeq, id, sessionID, prompt, delivery, timeCreated } }`, **not** SSE.
+- **`/api/event`** is the *single* global event route — no path params, no `after` cursor.
+- Event envelopes are SSE `data:` lines shaped `{ id, type, data }` — the payload field is **`data`** (there is no `properties` key on this build).
+- Text deltas arrive as `session.next.text.delta` with `data.delta`.
+- Turn step finish is `session.next.step.ended` with `data.finish` and `data.tokens` (`{ input, output, reasoning, cache }`).
+- **There is no `session.idle` event** and `POST /api/session/{id}/wait` 503s forever on this build — the proxy detects turn completion as `step.ended` followed by a 2s quiet gap (multi-step turns emit a new `session.next.step.started` inside that window).
+- Errors surface as an assistant message with `finish: "error"` and `error.message` (plus `session.error` events).
+- **Do not pin `location.directory` to a client-side path when creating sessions** — the server 500s prompts for directories that don't exist on the server. Omit `location` to use the server's workdir.
+- The live spec is served at `GET /doc` (OpenAPI 3.1 JSON; `/openapi.json` returns an HTML shell).
 - **`Model.Info` has no `status`/`enabled` fields** — pick the first available model by `id`.
 
 ## Environment
