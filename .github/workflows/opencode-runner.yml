@@ -1,0 +1,61 @@
+name: opencode-runner
+on:
+  workflow_dispatch:
+    inputs:
+      ttl_minutes:
+        description: "Job time-to-live in minutes (max 360)"
+        required: false
+        default: "360"
+        type: string
+      opencode_model:
+        description: "OpenCode model to use (optional)"
+        required: false
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: opencode-runner
+  cancel-in-progress: false
+jobs:
+  opencode:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event.inputs.ttl_minutes || 360 }}
+    env:
+      OPENCODE_SERVER_USERNAME: opencode
+      OPENCODE_SERVER_PASSWORD: ${{ secrets.OPENCODE_SERVER_PASSWORD }}
+    steps:
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+      - name: Connect to Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          test -n "$TAILSCALE_AUTH_KEY"
+          tailscale up --auth-key "$TAILSCALE_AUTH_KEY" --hostname "opencode-${GITHUB_RUN_ID}" --advertise-tags=tag:opencode-runner --accept-dns=false --ssh=false
+      - name: Install OpenCode
+        run: npm install -g opencode-ai@1.18.30
+      - name: Start OpenCode server
+        env:
+          OPENCODE_SERVER_USERNAME: opencode
+          OPENCODE_SERVER_PASSWORD: ${{ secrets.OPENCODE_SERVER_PASSWORD }}
+        run: |
+          opencode serve --hostname 0.0.0.0 --port 4096 --print-logs &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID"; tailscale logout' EXIT
+          for i in {1..30}; do
+            if curl -sS -u opencode:"${OPENCODE_SERVER_PASSWORD}" http://127.0.0.1:4096/api/health >/dev/null; then
+              echo "OpenCode server healthy"
+              break
+            fi
+            sleep 2
+          done
+          TAILSCALE_IP=$(tailscale ip -4)
+          echo "OpenCode server running at http://$TAILSCALE_IP:4096" >> "$GITHUB_STEP_SUMMARY"
+          echo "opencode_url=http://$TAILSCALE_IP:4096" >> "$GITHUB_OUTPUT"
+          wait

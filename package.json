@@ -1,0 +1,13 @@
+{
+  "name": "opencode-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenAI-compatible proxy for OpenCode running on an ephemeral GitHub Actions runner over Tailscale",
+  "type": "module",
+  "scripts": {
+    "test:opencode": "node test/opencode-proxy.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
