@@ -72,12 +72,12 @@ async function healthCheck(baseUrl) {
   try {
     const res = await fetch(`${baseUrl}/api/health`, {
       headers: { Authorization: basicAuth(), Accept: "application/json" },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(20000),
     });
     if (res.ok) return true;
     const res2 = await fetch(`${baseUrl}/global/health`, {
       headers: { Authorization: basicAuth(), Accept: "application/json" },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(20000),
     });
     return res2.ok;
   } catch {
@@ -164,7 +164,13 @@ async function createSession(baseUrl, modelRef) {
   // exist on the remote runner, and the agent loop 500s on prompts for
   // sessions rooted at a nonexistent directory. Omitting `location` lets the
   // server use its own workdir.
-  const body = { agent: "default" };
+  // NOTE 2: agent MUST be "build" (a real agent id). The name "default" is
+  // accepted at session creation but matches no agent, so EVERY model-driven
+  // tool call (write/read/bash/glob/...) fails server-side with "Unable to
+  // ...". Verified 2026-09-12 on opencode-ai@1.18.30 local `serve`: "default"
+  // session -> write/bash/read/glob all error; "build" session ->
+  // write/bash succeed (direct /session/{id}/shell bypass works either way).
+  const body = { agent: "build" };
   if (modelRef) body.model = modelRef;
   const res = await requestJson(baseUrl, `/api/session`, {
     method: "POST",
