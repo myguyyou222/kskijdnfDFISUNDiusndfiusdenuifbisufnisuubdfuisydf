@@ -7,9 +7,11 @@ const env = process.env;
 const config = {
   host: env.OPENCODE_PROXY_HOST ?? "127.0.0.1",
   port: Number(env.OPENCODE_PROXY_PORT ?? 4097),
-  workspace: env.OPENCODE_WORKSPACE ?? process.cwd(),
-  model: env.OPENCODE_MODEL,
-  directUrl: env.OPENCODE_URL,
+  // `||` (not `??`): an empty OPENCODE_WORKSPACE in .env must fall back to cwd,
+  // otherwise sessions are created with directory:"" and the server 500s.
+  workspace: env.OPENCODE_WORKSPACE || process.cwd(),
+  model: env.OPENCODE_MODEL || undefined,
+  directUrl: env.OPENCODE_URL || undefined,
   tailnet: env.TAILSCALE_TAILNET || "-",
   tailscaleApiKey: env.TAILSCALE_API_KEY,
   runnerTag: env.OPENCODE_RUNNER_TAG ?? "tag:opencode-runner",
@@ -119,18 +121,24 @@ async function requestJson(baseUrl, path, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
   try {
+    if (process.env.OPENCODE_DEBUG) console.log(`[debug] ${options.method ?? "GET"} ${path}`, JSON.stringify(options.body ?? ""));
     const res = await fetch(`${baseUrl}${path}`, {
       method: options.method ?? "GET",
       headers,
       body: options.body ? JSON.stringify(options.body) : undefined,
-      signal: controller.signal,
+      signal: options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal,
     });
     clearTimeout(timeout);
     if (!res.ok) {
       const text = await res.text();
+      if (process.env.OPENCODE_DEBUG) console.log(`[debug] -> ${res.status}`, text.slice(0, 300));
       throw new Error(`HTTP ${res.status}: ${text}`);
     }
-    return res.json();
+    // 204 / empty body (e.g. POST /api/session/{id}/wait) — nothing to parse.
+    if (res.status === 204) return null;
+    const text = await res.text();
+    if (!text) return null;
+    return JSON.parse(text);
   } catch (e) {
     clearTimeout(timeout);
     throw e;
@@ -139,11 +147,11 @@ async function requestJson(baseUrl, path, options = {}) {
 
 // OpenCode V2 routes accept a flat `directory` query param (or the
 // `x-opencode-directory` header). `location[directory]=...` is NOT a valid
-// shape and is rejected by the server.
+// shape and is rejected by the server. We deliberately send no filter: the
+// server scopes sessions to ITS workdir, and the proxy's local cwd does not
+// exist there. Per-session filtering happens client-side on sessionID.
 function locationQuery() {
-  const params = new URLSearchParams();
-  params.set("directory", config.workspace);
-  return params.toString();
+  return "";
 }
 
 async function listModels(baseUrl) {
@@ -152,10 +160,11 @@ async function listModels(baseUrl) {
 }
 
 async function createSession(baseUrl, modelRef) {
-  const body = {
-    agent: "default",
-    location: { directory: config.workspace },
-  };
+  // NOTE: do NOT send `location.directory` — the proxy's local cwd does not
+  // exist on the remote runner, and the agent loop 500s on prompts for
+  // sessions rooted at a nonexistent directory. Omitting `location` lets the
+  // server use its own workdir.
+  const body = { agent: "default" };
   if (modelRef) body.model = modelRef;
   const res = await requestJson(baseUrl, `/api/session`, {
     method: "POST",
@@ -291,15 +300,19 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
   const stream = openEventStream(baseUrl, signal);
 
   // Durably admit the user input and schedule agent-loop execution.
-  // Body shape per v2.session.prompt: { id, text, files, agents, skills?,
-  // metadata?, delivery?, resume? } — there is NO nested `prompt` object.
+  // Body shape per the live 1.18.30 spec (v2.session.prompt): the text lives in a
+  // REQUIRED nested `prompt` object: { id?, prompt: { text, files?, agents? },
+  // delivery?, resume? } (additionalProperties: false). A top-level `text` is
+  // rejected with a 500 ("Unexpected server error").
   await requestJson(baseUrl, `/api/session/${encodeURIComponent(sessionId)}/prompt`, {
     method: "POST",
     body: {
       id: messageId,
-      text: promptText,
-      files: [],
-      agents: [],
+      prompt: {
+        text: promptText,
+        files: [],
+        agents: [],
+      },
       delivery: "steer",
     },
   });
@@ -307,16 +320,34 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
   const textReceived = new Set();
   let finishReason = "stop";
   let stepTokens = null;
+  let ended = false;
 
   try {
-    for await (const event of stream) {
-      if (!event) break;
+    const iterator = stream[Symbol.asyncIterator]();
+    while (true) {
+      // After step.ended there is no `session.idle` event on 1.18.30 and its
+      // /wait route 503s forever; treat a quiet gap after a finished step as
+      // turn completion (multi-step turns restart within the settle window).
+      const step = ended
+        ? await Promise.race([
+            iterator.next().then(r => ({ event: r.value, done: r.done })),
+            new Promise(r => setTimeout(() => r({ idle: true }), 2000)),
+          ])
+        : await iterator.next().then(r => ({ event: r.value, done: r.done }));
+      if (step.idle) break;
+      const event = step.event;
+      if (step.done || !event) break;
       const type = event.type;
-      const props = event.properties || {};
+      // Live 1.18.30 envelopes carry the payload in `data`.
+      const props = event.data || {};
       // Only react to events for our session; ignore global noise.
       if (props.sessionID && props.sessionID !== sessionId) continue;
 
       switch (type) {
+        case "session.next.step.started": {
+          ended = false;
+          break;
+        }
         case "session.next.text.delta": {
           const textId = props.textID || props.id;
           if (!textReceived.has(textId)) {
@@ -336,24 +367,12 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
         case "session.next.step.ended": {
           finishReason = props.finish ?? "stop";
           stepTokens = props.tokens ?? null;
-          // A turn may run multiple steps; keep consuming until idle.
+          ended = true;
           break;
         }
         case "session.next.reasoning.delta": {
           // Reasoning content is not surfaced as chat text; ignore.
           break;
-        }
-        case "session.idle": {
-          let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-          if (stepTokens) {
-            usage = {
-              prompt_tokens: stepTokens.input ?? 0,
-              completion_tokens: stepTokens.output ?? 0,
-              total_tokens: (stepTokens.input ?? 0) + (stepTokens.output ?? 0),
-            };
-          }
-          yield { type: "finish", finishReason, usage };
-          return;
         }
         case "session.error": {
           throw new Error(props.error?.message ?? "OpenCode session error");
@@ -369,11 +388,12 @@ async function* runCompletion(baseUrl, modelRef, promptText, signal) {
     if (stream.return) stream.return();
   }
 
-  yield { type: "finish", finishReason, usage: stepTokens ? {
+  const usage = stepTokens ? {
     prompt_tokens: stepTokens.input ?? 0,
     completion_tokens: stepTokens.output ?? 0,
     total_tokens: (stepTokens.input ?? 0) + (stepTokens.output ?? 0),
-  } : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } };
+  } : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  yield { type: "finish", finishReason, usage };
 }
 
 function openaiModelList(models) {
