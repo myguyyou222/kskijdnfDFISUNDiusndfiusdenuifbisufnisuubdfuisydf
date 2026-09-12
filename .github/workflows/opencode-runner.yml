@@ -60,7 +60,7 @@ jobs:
             fi
             sleep 2
           done
-          TAILSCALE_IP=$(tailscale ip -4)
+          TAILSCALE_IP=$(sudo tailscale ip -4)
           echo "OpenCode server running at http://$TAILSCALE_IP:4096" >> "$GITHUB_STEP_SUMMARY"
           echo "opencode_url=http://$TAILSCALE_IP:4096" >> "$GITHUB_OUTPUT"
           wait
